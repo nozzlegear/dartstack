@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:html';
 import 'package:react/react_dom.dart' as react_dom;
 import 'package:over_react/over_react.dart';
@@ -10,10 +11,6 @@ void main() {
 
   val.intercept((change) {
     return change;
-  });
-
-  val.observe((newValue) {
-    print("Value changed to $newValue");
   });
 
   // NOTICE: It's VERY important to only get your observable values INSIDE the Observer's render function.
@@ -44,17 +41,15 @@ class Change<T> {
 class Observable<T> {
   T _value;
 
-  List<OnChange<T>> _changeListeners = [];
+  // List<OnChange<T>> _changeListeners = [];
 
   List<InterceptChange<T>> _interceptListeners = [];
 
   Observable(this._value);
 
-  static List<AccessWatcher> _globalAccessWatchers = [];
+  static StreamController<Observable<dynamic>> accessStream = new StreamController.broadcast();
 
-  static void addGlobalAccessWatcher(AccessWatcher watcher) => _globalAccessWatchers.add(watcher);
-
-  static void removeGlobalAccessWatcher(AccessWatcher watcher) => _globalAccessWatchers.remove(watcher);
+  StreamController<T> onChange = new StreamController.broadcast();
 
   set(T value) {
     var change = _interceptListeners.fold(new Change<T>(value), (Change<T> state, InterceptChange<T> intercept) {
@@ -65,16 +60,19 @@ class Observable<T> {
     if (change.prevent) return;
 
     this._value = change.newValue;
-    _changeListeners.forEach((listener) => listener(change.newValue));
+    onChange.add(change.newValue);
+    // _changeListeners.forEach((listener) => listener(change.newValue));
   }
 
   get() {
-    for (var watcher in _globalAccessWatchers) watcher(this);
+    // for (var watcher in _globalAccessWatchers) watcher(this);
+    // document.dispatchEvent(new Event(accessEventName));
+    accessStream.add(this);
 
     return this._value;
   }
 
-  observe(OnChange<T> onChange) => _changeListeners.add(onChange);
+  // observe(OnChange<T> onChange) => _changeListeners.add(onChange);
 
   intercept(InterceptChange<T> interceptor) => _interceptListeners.add(interceptor);
 }
@@ -112,51 +110,95 @@ class ObserverComponent extends UiComponent<ObserverProps> {
   /// A signel instance of a global access watcher. Should change and reset according to which observer is rendering.
   static AccessWatcher _onGlobalAccess = null;
 
-  static RenderAndObserveResult renderAndObserve(Render render) {
-    List<Observable<dynamic>> observables = [];
+  // static RenderAndObserveResult renderAndObserve(Render render) {
+  //   List<Observable<dynamic>> observables = [];
 
-    if (_globalAccessWatcher == null) {
-      _globalAccessWatcher = (observable) {
-        if (_onGlobalAccess != null) {
-          _onGlobalAccess(observable);
-        }
-      };
+  //   if (_globalAccessWatcher == null) {
+  //     print("Creating global access watcher");
 
-      Observable.addGlobalAccessWatcher(_globalAccessWatcher);
-    }
+  //     _globalAccessWatcher = (observable) {
+  //       if (_onGlobalAccess != null) {
+  //         _onGlobalAccess(observable);
+  //       }
+  //     };
 
-    var oldGlobalAccess = _onGlobalAccess;
-    _onGlobalAccess = observables.add;
+  //     // A list of instance-specific streams on each observable. When the observer starts listening it adds its stream
+  //     // to the list. When its done it calls close on the stream and removes it? These streams can actually replace the
+  //     // custom 'onChange' methods.
 
-    var result = render();
+  //     Observable.accessStream.stream.listen((obs) {
+  //       print("Observable accessed");
+  //       obs.onChange.stream.listen((_) {});
+  //     });
+  //   }
 
-    _onGlobalAccess = oldGlobalAccess;
+  //   var oldGlobalAccess = _onGlobalAccess;
+  //   _onGlobalAccess = observables.add;
 
-    return new RenderAndObserveResult(result, observables);
-  }
+  //   var result = render();
+
+  //   _onGlobalAccess = oldGlobalAccess;
+
+  //   return new RenderAndObserveResult(result, observables);
+  // }
+
+  List<StreamSubscription<dynamic>> instanceObservers = [];
 
   @override
   componentWillMount() {
-    // Dart streams would probably be perfect here, but since they're async it can't be used in the render process.
-    List<Observable<dynamic>> observables = [];
+    void watchAndRender() {
+      // Clear and cancel any instance observers from previous render cycles to prevent recursion
+      instanceObservers
+        ..forEach((sub) => sub.cancel())
+        ..clear();
 
-    void rerender() {
-      var renderResult = ObserverComponent.renderAndObserve(this.props.child);
-      this.renderedChild = renderResult.result;
-      observables = renderResult.observables;
+      // CREATE GLOBAL STREAM LISTENER HERE
 
-      // There's probably a bug here that will cause these functions to continue to be called and redraw the Observer.
-      // They need to be disposed in some way so they'll never be called after they're no longer used in the observer.
-      // Best way to do that is making the Observable.observe function return a class that can be used to call .dispose.
-      observables.forEach((observable) => observable.observe((newValue) => rerender()));
+      this.renderedChild = this.props.child();
+
+      // Cancel global subscription as this instance is no longer interested in changing values.
+      // globalSub.cancel();
 
       if (this.hasMounted) {
         this.redraw();
       }
     }
 
-    rerender();
+    // PROBLEM: streams are async and run in "microtasks" rather than asynchronously. So when we
+    // wire up the global access stream listener and then shut it down after rendering the child,
+    // none of those access events have been pushed to the stream yet. Strangely this seems to
+    // be working without all kinds of recursion by just leaving the globalSub alive and cancelling
+    // the instance-specific streams on each redraw.
 
+    var globalSub = Observable.accessStream.stream.listen((obs) {
+      print("Accessed observable with hascode ${obs.hashCode}");
+      // TODO: Add observable subscription to instance-specific list
+      var sub = obs.onChange.stream.listen((val) {
+        watchAndRender();
+      });
+      instanceObservers.add(sub);
+    }, cancelOnError: false);
+
+    // 1. Attach to the global access stream.
+    // 2. Render the child.
+    // 3. Disconnect from the access stream.
+    // 4. Maintain a list of instance-specific observable streams.
+    // 5. On next redraw, disconnect all of those observable subscriptions.
+    // 6. GOTO 1.
+
+    // if (!this.hasMounted) {
+    //   Observable.accessStream.stream.listen((obs) {
+    //     print("Observable accessed");
+    //     obs.onChange.stream.listen((_) {
+    //       this.renderedChild = this.props.child();
+    //       this.redraw();
+    //     });
+    //   });
+    // }
+
+    // this.renderedChild = this.props.child();
+
+    watchAndRender();
     this.hasMounted = true;
 
     super.componentWillMount();
