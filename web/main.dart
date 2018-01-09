@@ -47,7 +47,7 @@ class Observable<T> {
 
   Observable(this._value);
 
-  static StreamController<Observable<dynamic>> accessStream = new StreamController.broadcast();
+  static SynchronousStreamController<Observable<dynamic>> accessStream = new StreamController.broadcast(sync: true);
 
   StreamController<T> onChange = new StreamController.broadcast();
 
@@ -61,18 +61,15 @@ class Observable<T> {
 
     this._value = change.newValue;
     onChange.add(change.newValue);
-    // _changeListeners.forEach((listener) => listener(change.newValue));
   }
 
   get() {
-    // for (var watcher in _globalAccessWatchers) watcher(this);
-    // document.dispatchEvent(new Event(accessEventName));
-    accessStream.add(this);
+    if (accessStream.hasListener) {
+      accessStream.add(this);
+    }
 
     return this._value;
   }
-
-  // observe(OnChange<T> onChange) => _changeListeners.add(onChange);
 
   intercept(InterceptChange<T> interceptor) => _interceptListeners.add(interceptor);
 }
@@ -104,10 +101,7 @@ class ObserverComponent extends UiComponent<ObserverProps> {
 
   bool hasMounted = false;
 
-  /// A single instance of a global access watcher. Should never be changed after instantiation.
-  static AccessWatcher _globalAccessWatcher = null;
-
-  /// A signel instance of a global access watcher. Should change and reset according to which observer is rendering.
+  /// A single instance of a global access watcher. Should change and reset according to which observer is rendering.
   static AccessWatcher _onGlobalAccess = null;
 
   // static RenderAndObserveResult renderAndObserve(Render render) {
@@ -152,31 +146,31 @@ class ObserverComponent extends UiComponent<ObserverProps> {
         ..forEach((sub) => sub.cancel())
         ..clear();
 
-      // CREATE GLOBAL STREAM LISTENER HERE
-
       this.renderedChild = this.props.child();
-
-      // Cancel global subscription as this instance is no longer interested in changing values.
-      // globalSub.cancel();
 
       if (this.hasMounted) {
         this.redraw();
       }
     }
 
-    // PROBLEM: streams are async and run in "microtasks" rather than asynchronously. So when we
-    // wire up the global access stream listener and then shut it down after rendering the child,
-    // none of those access events have been pushed to the stream yet. Strangely this seems to
-    // be working without all kinds of recursion by just leaving the globalSub alive and cancelling
-    // the instance-specific streams on each redraw.
+    // BUG: We listen to the global stream for access to any observable then we subscribe to that
+    // observable and redraw whenever it changes. This means we redraw when *any* observable changes,
+    // not just one that was used in this observer.
 
-    var globalSub = Observable.accessStream.stream.listen((obs) {
-      print("Accessed observable with hascode ${obs.hashCode}");
-      // TODO: Add observable subscription to instance-specific list
-      var sub = obs.onChange.stream.listen((val) {
-        watchAndRender();
-      });
-      instanceObservers.add(sub);
+    // INFO: previously I had attempted to subscribe to the access stream before rendering the child,
+    // then add the accessed observables to the instance-specific list as they were accessed in the
+    // child's render function, and finally remove the access stream subscription after child rendering
+    // completed. THe problem is that in Dart streams are async and run in "microtasks" rather than
+    // asynchronously. So when we wire up the global access stream listener and then shut it down after
+    // rendering the child, none of those access events have been pushed to the stream yet.
+
+    // SOLUTION: It's possible to create synchronous global streams where the event is dispatched
+    // immediately, though it's technically an antipattern.
+
+    Observable.accessStream.stream.listen((obs) {
+      print("Accessed observable with hashcode ${obs.hashCode}");
+      // Add observable subscription to instance-specific list
+      instanceObservers.add(obs.onChange.stream.listen((val) => watchAndRender()));
     }, cancelOnError: false);
 
     // 1. Attach to the global access stream.
@@ -185,18 +179,6 @@ class ObserverComponent extends UiComponent<ObserverProps> {
     // 4. Maintain a list of instance-specific observable streams.
     // 5. On next redraw, disconnect all of those observable subscriptions.
     // 6. GOTO 1.
-
-    // if (!this.hasMounted) {
-    //   Observable.accessStream.stream.listen((obs) {
-    //     print("Observable accessed");
-    //     obs.onChange.stream.listen((_) {
-    //       this.renderedChild = this.props.child();
-    //       this.redraw();
-    //     });
-    //   });
-    // }
-
-    // this.renderedChild = this.props.child();
 
     watchAndRender();
     this.hasMounted = true;
