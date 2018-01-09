@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:html';
 import 'package:react/react_dom.dart' as react_dom;
 import 'package:over_react/over_react.dart';
@@ -15,12 +16,19 @@ void main() {
 
   // NOTICE: It's VERY important to only get your observable values INSIDE the Observer's render function.
   var title = (Dom.h1()..key = "title");
-  var input = () => Dom.input()
-    ..type = "text"
-    ..value = val.get()
-    ..onChange = ((evt) => val.set(evt.target.value));
+  var input = () {
+    var value = val.get();
 
-  var app = (Observer()..child = () => Dom.div()(title("Observable value is ${val.get()}"), input()()))();
+    return Dom.input()
+      ..key = "my-text-input"
+      ..type = "text"
+      ..value = value
+      ..onChange = ((evt) => val.set(evt.target.value));
+  };
+
+  var app = (Observer()
+    ..child = () => Dom.div()((Dom.img()..src = "https://media1.giphy.com/media/BoBOKNtlR8rTi/giphy.gif")(),
+        title("Observable value is ${val.get()}"), input()()))();
 
   react_dom.render(app, document.getElementById("output"));
 }
@@ -41,15 +49,29 @@ class Change<T> {
 class Observable<T> {
   T _value;
 
-  // List<OnChange<T>> _changeListeners = [];
+  Observable(this._value);
 
   List<InterceptChange<T>> _interceptListeners = [];
 
-  Observable(this._value);
+  /// A synchronous event stream that receives an event whenever *any* observable's value is
+  /// accessed with `observable.get()`.
+  static var accessStreamSync = new StreamController<Observable<dynamic>>.broadcast(sync: true);
 
-  static SynchronousStreamController<Observable<dynamic>> accessStream = new StreamController.broadcast(sync: true);
+  /// An asynchronous event stream that receives an event whenever *any* observable's value is
+  /// accessed with `observable.get()`.
+  static var accessStreamAsync = new StreamController<Observable<dynamic>>.broadcast();
 
-  StreamController<T> onChange = new StreamController.broadcast();
+  /// A synchronous event stream that receives an event whenever the observable's value changes.
+  ///
+  /// Forced to synchronous because React state can become out of sync when the observable is used
+  /// in a React component (for instance, updating a controlled input will force the cursor to the
+  /// end of the line after every keypress).
+  /// https://stackoverflow.com/a/28922465
+  var onChangeSync = new StreamController<T>.broadcast(sync: true);
+
+  /// An asynchronous event stream that receives an event whenever the observable's value changes. If
+  /// you need to intercept and potentially change the new value, use the observable's `intercept` method.
+  var onChangeAsync = new StreamController<T>.broadcast(sync: true);
 
   set(T value) {
     var change = _interceptListeners.fold(new Change<T>(value), (Change<T> state, InterceptChange<T> intercept) {
@@ -60,22 +82,29 @@ class Observable<T> {
     if (change.prevent) return;
 
     this._value = change.newValue;
-    onChange.add(change.newValue);
+
+    if (onChangeAsync.hasListener) {
+      onChangeAsync.add(change.newValue);
+    }
+
+    if (onChangeSync.hasListener) {
+      onChangeSync.add(change.newValue);
+    }
   }
 
-  get() {
-    if (accessStream.hasListener) {
-      accessStream.add(this);
+  T get() {
+    if (accessStreamAsync.hasListener) {
+      accessStreamAsync.add(this);
+    }
+
+    if (accessStreamSync.hasListener) {
+      accessStreamSync.add(this);
     }
 
     return this._value;
   }
 
   intercept(InterceptChange<T> interceptor) => _interceptListeners.add(interceptor);
-}
-
-ReactElement statelessFunc() {
-  return (Dom.div()..className = "Hello world!!")("Hello world, this was built from a stateless boi");
 }
 
 typedef ReactElement Render();
@@ -88,71 +117,61 @@ class ObserverProps extends UiProps {
   Render child;
 }
 
-class RenderAndObserveResult {
-  List<Observable<dynamic>> observables = [];
-  ReactElement result;
-
-  RenderAndObserveResult(this.result, this.observables);
+@State()
+class ObserverState extends UiState {
+  ReactElement currentChild;
 }
 
 @Component()
-class ObserverComponent extends UiComponent<ObserverProps> {
-  ReactElement renderedChild;
+class ObserverComponent extends UiStatefulComponent<ObserverProps, ObserverState> {
+  var observerSubscriptions = new HashMap<Observable<dynamic>, StreamSubscription<dynamic>>();
 
-  bool hasMounted = false;
+  static ReactElement watchAndRenderStatic(Render renderChild, StreamController<Observable<dynamic>> watcher) {
+    // Use Observable's synchronous access stream, so we'll immediately learn of which observables are used when
+    // rendering the child. If it were async we wouldn't get any of the observables before the subscription is closed.
+    var accessListener = Observable.accessStreamSync.stream.listen(watcher.add);
+    var child = renderChild();
 
-  /// A single instance of a global access watcher. Should change and reset according to which observer is rendering.
-  static AccessWatcher _onGlobalAccess = null;
+    // Cancel the access subscription to immediately stop receiving events.
+    accessListener.cancel();
 
-  // static RenderAndObserveResult renderAndObserve(Render render) {
-  //   List<Observable<dynamic>> observables = [];
+    return child;
+  }
 
-  //   if (_globalAccessWatcher == null) {
-  //     print("Creating global access watcher");
+  ReactElement react() {
+    // 1. Attach to the global access stream.
+    // 2. Render the child.
+    // 3. Disconnect from the access stream.
+    // 4. Maintain a list of instance-specific observable streams.
+    // 5. On next reaction, disconnect all of those observable subscriptions.
+    // 6. GOTO 1.
 
-  //     _globalAccessWatcher = (observable) {
-  //       if (_onGlobalAccess != null) {
-  //         _onGlobalAccess(observable);
-  //       }
-  //     };
+    // Clear and cancel any instance observers from previous render cycles to prevent recursion
+    observerSubscriptions
+      ..forEach((_, sub) => sub.cancel())
+      ..clear();
 
-  //     // A list of instance-specific streams on each observable. When the observer starts listening it adds its stream
-  //     // to the list. When its done it calls close on the stream and removes it? These streams can actually replace the
-  //     // custom 'onChange' methods.
+    var instanceWatcher = new StreamController<Observable<dynamic>>()
+      ..stream.listen((obs) {
+        // Check if the observer is already being tracked. If not, subscribe to its sync change stream and add it to the map of tracked observables.
+        observerSubscriptions.putIfAbsent(
+            obs, () => obs.onChangeSync.stream.listen((val) => this.setState(newState()..currentChild = react())));
+      });
+    var renderedChild = ObserverComponent.watchAndRenderStatic(this.props.child, instanceWatcher);
 
-  //     Observable.accessStream.stream.listen((obs) {
-  //       print("Observable accessed");
-  //       obs.onChange.stream.listen((_) {});
-  //     });
-  //   }
+    // Close the stream as this instance is no longer interested in accessed observables.
+    instanceWatcher.close();
 
-  //   var oldGlobalAccess = _onGlobalAccess;
-  //   _onGlobalAccess = observables.add;
+    return renderedChild;
+  }
 
-  //   var result = render();
-
-  //   _onGlobalAccess = oldGlobalAccess;
-
-  //   return new RenderAndObserveResult(result, observables);
-  // }
-
-  List<StreamSubscription<dynamic>> instanceObservers = [];
+  @override
+  getInitialState() {
+    return newState()..currentChild = react();
+  }
 
   @override
   componentWillMount() {
-    void watchAndRender() {
-      // Clear and cancel any instance observers from previous render cycles to prevent recursion
-      instanceObservers
-        ..forEach((sub) => sub.cancel())
-        ..clear();
-
-      this.renderedChild = this.props.child();
-
-      if (this.hasMounted) {
-        this.redraw();
-      }
-    }
-
     // BUG: We listen to the global stream for access to any observable then we subscribe to that
     // observable and redraw whenever it changes. This means we redraw when *any* observable changes,
     // not just one that was used in this observer.
@@ -164,35 +183,28 @@ class ObserverComponent extends UiComponent<ObserverProps> {
     // asynchronously. So when we wire up the global access stream listener and then shut it down after
     // rendering the child, none of those access events have been pushed to the stream yet.
 
-    // SOLUTION: It's possible to create synchronous global streams where the event is dispatched
-    // immediately, though it's technically an antipattern.
+    // SOLUTION: It's possible to create synchronous global streams where the event is dispatched.
 
-    Observable.accessStream.stream.listen((obs) {
-      print("Accessed observable with hashcode ${obs.hashCode}");
-      // Add observable subscription to instance-specific list
-      instanceObservers.add(obs.onChange.stream.listen((val) => watchAndRender()));
-    }, cancelOnError: false);
-
-    // 1. Attach to the global access stream.
-    // 2. Render the child.
-    // 3. Disconnect from the access stream.
-    // 4. Maintain a list of instance-specific observable streams.
-    // 5. On next redraw, disconnect all of those observable subscriptions.
-    // 6. GOTO 1.
-
-    watchAndRender();
-    this.hasMounted = true;
+    // SOLUTION: What if we use sync global stream, then make the Observer class itself listen to that
+    // stream. Next we have each observer create its own stream, give it to the Observer class before
+    // rendering the child. Because the global stream is sync, we can immediately post the accessed
+    // observers to the instance stream and close it after rendering the child.
 
     super.componentWillMount();
   }
 
   @override
   componentWillUnmount() {
+    // Clear all subscriptions to prevent accidentally attempted to react to observable changes.
+    observerSubscriptions
+      ..forEach((_, sub) => sub.cancel())
+      ..clear();
+
     super.componentWillUnmount();
   }
 
   @override
   ReactElement render() {
-    return this.renderedChild;
+    return this.state.currentChild;
   }
 }
