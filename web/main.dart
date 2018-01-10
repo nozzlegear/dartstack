@@ -37,8 +37,6 @@ typedef void OnChange<T>(T newValue);
 
 typedef Change<T> InterceptChange<T>(Change<T> incomingChange);
 
-typedef void AccessWatcher(Observable<dynamic> onAccess);
-
 class Change<T> {
   T newValue;
   bool prevent = false;
@@ -126,14 +124,10 @@ class ObserverState extends UiState {
 class ObserverComponent extends UiStatefulComponent<ObserverProps, ObserverState> {
   var observerSubscriptions = new HashMap<Observable<dynamic>, StreamSubscription<dynamic>>();
 
-  static ReactElement watchAndRenderStatic(Render renderChild, StreamController<Observable<dynamic>> watcher) {
-    // Use Observable's synchronous access stream, so we'll immediately learn of which observables are used when
-    // rendering the child. If it were async we wouldn't get any of the observables before the subscription is closed.
-    var accessListener = Observable.accessStreamSync.stream.listen(watcher.add);
+  ReactElement watchAndRenderStatic(Render renderChild, StreamController<Observable<dynamic>> watcher) {
+    AccessWatcher.beginWatch(watcher);
     var child = renderChild();
-
-    // Cancel the access subscription to immediately stop receiving events.
-    accessListener.cancel();
+    AccessWatcher.endWatch(watcher);
 
     return child;
   }
@@ -157,7 +151,7 @@ class ObserverComponent extends UiStatefulComponent<ObserverProps, ObserverState
         observerSubscriptions.putIfAbsent(
             obs, () => obs.onChangeSync.stream.listen((val) => this.setState(newState()..currentChild = react())));
       });
-    var renderedChild = ObserverComponent.watchAndRenderStatic(this.props.child, instanceWatcher);
+    var renderedChild = watchAndRenderStatic(this.props.child, instanceWatcher);
 
     // Close the stream as this instance is no longer interested in accessed observables.
     instanceWatcher.close();
@@ -206,5 +200,38 @@ class ObserverComponent extends UiStatefulComponent<ObserverProps, ObserverState
   @override
   ReactElement render() {
     return this.state.currentChild;
+  }
+}
+
+class AccessWatcher {
+  static List<StreamController<Observable<dynamic>>> streams = [];
+
+  static StreamSubscription<Observable<dynamic>> accessWatcher;
+
+  static void beginWatch(StreamController<Observable<dynamic>> streamController) {
+    // Create the access watcher subscription if necessary.
+    // The access stream should only ever notify the *latest* listener
+    // to be added to the list. Once that listener is done it gets removed
+    // and the next latest listener starts listening again.
+    streams.add(streamController);
+
+    if (accessWatcher == null) {
+      // Use Observable's synchronous access stream, so we'll immediately learn of which observables are used when
+      // rendering the child. If it were async we wouldn't get any of the observables before the subscription is closed.
+      accessWatcher = Observable.accessStreamSync.stream.listen((obs) {
+        if (streams.isNotEmpty) {
+          streams.last.add(obs);
+        }
+      });
+    }
+  }
+
+  static void endWatch(StreamController<Observable<dynamic>> streamController) {
+    streams.removeWhere((s) => s.hashCode == streamController.hashCode);
+
+    if (streams.isEmpty) {
+      accessWatcher.cancel();
+      accessWatcher = null;
+    }
   }
 }
