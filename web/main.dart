@@ -10,9 +10,30 @@ void main() {
 
   var val = new Observable("test");
 
-  val.intercept((change) {
-    return change;
-  });
+  // var myDiv = div(
+  //   props()
+  //     ..accept = "test"
+  //     ..accept = "test2"
+  //     ..accept = "test3",
+  //   [
+  //     div(null, []),
+  //     div(null, []),
+  //   ],
+  // );
+  // var myDiv2 = (Dom.div()
+  //   ..accept = "test"
+  //   ..accept = "test2")(
+  //   Dom.div()("test"),
+  //   Dom.div()("testing again"),
+  // );
+
+  var observable1 = new Observable("This is observable 1");
+  var observable2 = new Observable("This is observable 2");
+
+  var changeObs2Button = (Dom.button()
+    ..onChange = (_) => observable2.set("Observable two is now ${new DateTime.now().millisecondsSinceEpoch}"))(
+    "Click to change observable 2",
+  );
 
   // NOTICE: It's VERY important to only get your observable values INSIDE the Observer's render function.
   var title = (Dom.h1()..key = "title");
@@ -26,9 +47,27 @@ void main() {
       ..onChange = ((evt) => val.set(evt.target.value));
   };
 
-  var app = (Observer()
-    ..child = () => Dom.div()((Dom.img()..src = "https://media1.giphy.com/media/BoBOKNtlR8rTi/giphy.gif")(),
-        title("Observable value is ${val.get()}"), input()()))();
+  var child = () => Dom.div()(
+        Dom.h1()(
+          observable1.get(),
+        ),
+        Observer()
+          ..child = () => Dom.h1()(
+                observable2.get(),
+              ),
+        changeObs2Button,
+      );
+
+  var app = Dom.div()(
+    (Observer()..child = child)(),
+  );
+
+  // var app = (Observer()
+  //   ..child = () => Dom.div()(
+  //         (Dom.img()..src = "https://media1.giphy.com/media/BoBOKNtlR8rTi/giphy.gif")(),
+  //         title("Observable value is ${val.get()}"),
+  //         input()(),
+  //       ))();
 
   react_dom.render(app, document.getElementById("output"));
 }
